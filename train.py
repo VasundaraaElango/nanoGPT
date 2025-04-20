@@ -16,6 +16,10 @@ $ torchrun --nproc_per_node=8 --nnodes=2 --node_rank=1 --master_addr=123.456.123
 (If your cluster does not have Infiniband interconnect prepend NCCL_IB_DISABLE=1)
 """
 
+# ======================
+# Full training script with loss plotting
+# ======================
+
 import os
 import time
 import math
@@ -28,6 +32,11 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 
 from model import GPTConfig, GPT
+import matplotlib.pyplot as plt  # <-- added for plotting
+
+# Track loss
+train_loss_log = []
+val_loss_log = []
 
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
@@ -246,30 +255,30 @@ if wandb_log and master_process:
     import wandb
     wandb.init(project=wandb_project, name=wandb_run_name, config=config)
 
-# training loop
-X, Y = get_batch('train') # fetch the very first batch
+# Training loop
+X, Y = get_batch('train')
 t0 = time.time()
-local_iter_num = 0 # number of iterations in the lifetime of this process
-raw_model = model.module if ddp else model # unwrap DDP container if needed
+local_iter_num = 0
+raw_model = model.module if ddp else model
 running_mfu = -1.0
 while True:
 
-    # determine and set the learning rate for this iteration
     lr = get_lr(iter_num) if decay_lr else learning_rate
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
 
-    # evaluate the loss on train/val sets and write checkpoints
     if iter_num % eval_interval == 0 and master_process:
         losses = estimate_loss()
         print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+        train_loss_log.append(losses['train'].item())
+        val_loss_log.append(losses['val'].item())
         if wandb_log:
             wandb.log({
                 "iter": iter_num,
                 "train/loss": losses['train'],
                 "val/loss": losses['val'],
                 "lr": lr,
-                "mfu": running_mfu*100, # convert to percentage
+                "mfu": running_mfu * 100,
             })
         if losses['val'] < best_val_loss or always_save_checkpoint:
             best_val_loss = losses['val']
@@ -287,50 +296,53 @@ while True:
     if iter_num == 0 and eval_only:
         break
 
-    # forward backward update, with optional gradient accumulation to simulate larger batch size
-    # and using the GradScaler if data type is float16
     for micro_step in range(gradient_accumulation_steps):
         if ddp:
-            # in DDP training we only need to sync gradients at the last micro step.
-            # the official way to do this is with model.no_sync() context manager, but
-            # I really dislike that this bloats the code and forces us to repeat code
-            # looking at the source of that context manager, it just toggles this variable
             model.require_backward_grad_sync = (micro_step == gradient_accumulation_steps - 1)
         with ctx:
             logits, loss = model(X, Y)
-            loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
-        # immediately async prefetch next batch while model is doing the forward pass on the GPU
+            loss = loss / gradient_accumulation_steps
         X, Y = get_batch('train')
-        # backward pass, with gradient scaling if training in fp16
         scaler.scale(loss).backward()
-    # clip the gradient
     if grad_clip != 0.0:
         scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-    # step the optimizer and scaler if training in fp16
     scaler.step(optimizer)
     scaler.update()
-    # flush the gradients as soon as we can, no need for this memory anymore
     optimizer.zero_grad(set_to_none=True)
 
-    # timing and logging
     t1 = time.time()
     dt = t1 - t0
     t0 = t1
     if iter_num % log_interval == 0 and master_process:
-        # get loss as float. note: this is a CPU-GPU sync point
-        # scale up to undo the division above, approximating the true total loss (exact would have been a sum)
         lossf = loss.item() * gradient_accumulation_steps
-        if local_iter_num >= 5: # let the training loop settle a bit
+        if local_iter_num >= 5:
             mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
-            running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
-        print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
+            running_mfu = mfu if running_mfu == -1.0 else 0.9 * running_mfu + 0.1 * mfu
+        print(f"iter {iter_num}: loss {lossf:.4f}, time {dt * 1000:.2f}ms, mfu {running_mfu * 100:.2f}%")
     iter_num += 1
     local_iter_num += 1
 
-    # termination conditions
     if iter_num > max_iters:
         break
 
 if ddp:
     destroy_process_group()
+
+# =======================
+# Plot training and validation loss
+# =======================
+if master_process:
+    try:
+        plt.plot(np.arange(len(train_loss_log)) * eval_interval, train_loss_log, label='Train Loss')
+        plt.plot(np.arange(len(val_loss_log)) * eval_interval, val_loss_log, label='Val Loss')
+        plt.title("Loss Curve (2000 Iterations)")
+        plt.xlabel("Iteration")
+        plt.ylabel("Loss")
+        plt.legend()
+        plt.grid(True)
+        plt.savefig("loss_curve_2000_iters.png")
+        plt.show()
+    except Exception as e:
+        print("Could not plot loss curve:", e)
+
